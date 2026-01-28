@@ -1,0 +1,220 @@
+# ============================================================
+# ORÁCULO-LIX | APP ANALÍTICO COM VISUALIZAÇÃO
+# ============================================================
+
+import random, time, math, threading, csv, os
+from collections import deque, Counter
+import numpy as np
+from flask import Flask, jsonify
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CORES = ["BRANCO", "VERMELHO", "PRETO"]
+COR_IDX = {c:i for i,c in enumerate(CORES)}
+IDX_COR = {i:c for c,i in COR_IDX.items()}
+CICLO = 3
+
+ENTROPIA_MAX_SEGURA = 0.65
+CONFIANCA_MIN = 60  # %
+
+HIST_FILE = "historico.csv"
+
+# ============================================================
+# REDE SIMPLES
+# ============================================================
+
+class Neural:
+    def __init__(self):
+        self.w = np.random.randn(3,3) * 0.1
+
+    def prever(self, x):
+        return int(np.argmax(self.w @ x))
+
+    def treinar(self, x, y):
+        p = self.prever(x)
+        if p != y:
+            self.w[y] += 0.05 * x
+            self.w[p] -= 0.05 * x
+
+# ============================================================
+# LINHA DO TEMPO
+# ============================================================
+
+class Linha:
+    def __init__(self, i):
+        self.id = i
+        self.hist = deque(maxlen=200)
+        self.entropia = 1.0
+
+    def gerar(self):
+        r = random.random()
+        if r < 0.07: return "BRANCO"
+        return "VERMELHO" if r < 0.535 else "PRETO"
+
+    def passo(self):
+        self.hist.append(self.gerar())
+        self.entropia = self.calc_entropia()
+
+    def calc_entropia(self):
+        if len(self.hist) < 10:
+            return 1.0
+        c = Counter(self.hist)
+        t = sum(c.values())
+        e = 0
+        for v in c.values():
+            p = v/t
+            e -= p * math.log(p + 1e-9)
+        return round(e / math.log(3), 3)
+
+# ============================================================
+# ORÁCULO
+# ============================================================
+
+class Oraculo:
+    def __init__(self):
+        self.linhas = [Linha(i) for i in range(5)]
+        self.rede = Neural()
+        self.rodada = 0
+        self.ia_on = True
+        self.obs = False
+        self.estado = {}
+
+        if not os.path.exists(HIST_FILE):
+            with open(HIST_FILE,"w",newline="") as f:
+                csv.writer(f).writerow([
+                    "rodada","entropia","confianca","previsao","resultado"
+                ])
+
+    def vetor(self, h):
+        v = np.zeros(3)
+        for c in h:
+            v[COR_IDX[c]] += 1
+        return v / (np.sum(v)+1e-9)
+
+    def confianca(self, ent_min, ent_med):
+        base = (1 - ent_min) * 70 + (1 - ent_med) * 30
+        return int(max(0, min(100, base)))
+
+    def ciclo(self):
+        for l in self.linhas:
+            l.passo()
+
+        ativa = min(self.linhas, key=lambda x:x.entropia)
+        ent_med = sum(l.entropia for l in self.linhas)/len(self.linhas)
+        conf = self.confianca(ativa.entropia, ent_med)
+
+        previsao = None
+        janela_segura = (
+            ativa.entropia < ENTROPIA_MAX_SEGURA and conf >= CONFIANCA_MIN
+        )
+
+        if not self.obs and (not self.ia_on or janela_segura):
+            x = self.vetor(ativa.hist)
+            y = COR_IDX[ativa.hist[-1]]
+            self.rede.treinar(x,y)
+            previsao = IDX_COR[self.rede.prever(x)]
+
+        self.estado = {
+            "rodada": self.rodada,
+            "entropia_linha": ativa.entropia,
+            "entropia_media": round(ent_med,3),
+            "confianca": conf,
+            "janela_segura": janela_segura,
+            "ia_auxiliar": self.ia_on,
+            "modo_observacao": self.obs,
+            "previsao": previsao,
+            "resultado": ativa.hist[-1]
+        }
+
+        with open(HIST_FILE,"a",newline="") as f:
+            csv.writer(f).writerow([
+                self.rodada,
+                ativa.entropia,
+                conf,
+                previsao,
+                ativa.hist[-1]
+            ])
+
+        self.rodada += 1
+
+# ============================================================
+# APP WEB
+# ============================================================
+
+app = Flask(__name__)
+orc = Oraculo()
+
+@app.route("/")
+def ui():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ORÁCULO LIX</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body style="background:#0f0f0f;color:#0f0;font-family:monospace">
+
+<h2>ORÁCULO-LIX</h2>
+
+<button onclick="fetch('/ia',{method:'POST'})">IA AUXILIAR</button>
+<button onclick="fetch('/obs',{method:'POST'})">OBSERVAÇÃO</button>
+
+<p id="status"></p>
+<canvas id="graf" height="120"></canvas>
+
+<script>
+let ctx = document.getElementById("graf").getContext("2d");
+let chart = new Chart(ctx,{
+ type:"line",
+ data:{labels:[],datasets:[
+  {label:"Entropia Linha",data:[]},
+  {label:"Entropia Média",data:[]}
+ ]}
+});
+
+setInterval(()=>{
+ fetch('/estado').then(r=>r.json()).then(j=>{
+  document.getElementById("status").innerText =
+   "Confiança: "+j.confianca+"% | Janela segura: "+j.janela_segura+
+   " | Previsão: "+(j.previsao ?? "ANALISANDO");
+
+  chart.data.labels.push(j.rodada);
+  chart.data.datasets[0].data.push(j.entropia_linha);
+  chart.data.datasets[1].data.push(j.entropia_media);
+  chart.update();
+ })
+},1000);
+</script>
+</body>
+</html>
+"""
+
+@app.route("/estado")
+def estado():
+    return jsonify(orc.estado)
+
+@app.route("/ia",methods=["POST"])
+def ia():
+    orc.ia_on = not orc.ia_on
+    return ("",204)
+
+@app.route("/obs",methods=["POST"])
+def obs():
+    orc.obs = not orc.obs
+    return ("",204)
+
+def loop():
+    while True:
+        orc.ciclo()
+        time.sleep(CICLO)
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    threading.Thread(target=loop,daemon=True).start()
+    app.run(port=7777,debug=False)
